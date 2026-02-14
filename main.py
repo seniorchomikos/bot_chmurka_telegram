@@ -35,7 +35,7 @@ def load_config() -> Config:
         raise RuntimeError("Brak BOT_TOKEN w zmiennych środowiskowych.")
     admin_ids = {
         int(value)
-        for value in os.getenv("ADMIN_IDS", "6498309404").split(",")
+        for value in os.getenv("ADMIN_IDS", "6498309404, 7541441567").split(",")
         if value.strip().isdigit()
     }
     database_url = os.getenv("DATABASE_URL")
@@ -299,6 +299,17 @@ async def create_order(
     return row[0]
 
 
+async def fetch_order_details(order_id: int) -> Optional[tuple[int, str, str, int, float, str, str, str]]:
+    return await DB.execute(
+        """
+        SELECT id, username, product_name, quantity, total_price, delivery_method, address, status
+        FROM orders
+        WHERE id = ?
+        """,
+        (order_id,), fetchone=True
+    )
+
+
 async def update_order_status(order_id: int, status: str) -> Optional[int]:
     row = await DB.execute(
         "UPDATE orders SET status = ? WHERE id = ? RETURNING user_id",
@@ -342,9 +353,15 @@ async def get_pending_orders() -> list[tuple[int, str, str, int, float]]:
     )
 
 
-async def get_order_history() -> list[tuple[int, str, str, int, str]]:
+async def get_order_history() -> list[tuple[int, str, str, int, str, float, str]]:
     return await DB.execute(
-        "SELECT id, username, product_name, quantity, status FROM orders WHERE status != 'pending' ORDER BY created_at DESC LIMIT 10",
+        """
+        SELECT id, username, product_name, quantity, status, total_price, delivery_method 
+        FROM orders 
+        WHERE status != 'pending' 
+        ORDER BY created_at DESC 
+        LIMIT 10
+        """,
         fetchall=True
     )
 
@@ -399,9 +416,11 @@ class OrderStates(StatesGroup):
     entering_quantity = State()
     choosing_delivery = State()
     choosing_shipping = State()
+    choosing_dpd_option = State()
     entering_address = State()
-    choosing_pickup_city = State()
+    entering_phone = State()
     choosing_payment = State()
+    confirming_order = State()
 
 
 # =========================
@@ -493,8 +512,16 @@ def delivery_keyboard() -> InlineKeyboardBuilder:
 def shipping_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text="🚚 DPD", callback_data="shipping:DPD")
-    builder.button(text="📮 InPost", callback_data="shipping:InPost")
+    builder.button(text="📮 InPost (+12 PLN)", callback_data="shipping:InPost")
     builder.adjust(2)
+    return builder
+
+
+def dpd_options_keyboard() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏪 Do punktu (+6 PLN)", callback_data="dpd_option:point")
+    builder.button(text="📦 Do automatu (+10 PLN)", callback_data="dpd_option:machine")
+    builder.adjust(1)
     return builder
 
 
@@ -842,9 +869,18 @@ async def list_order_history(message: Message) -> None:
     if not orders:
         await message.answer("📭 Brak historii zamówień.")
         return
-    text = "🕰️ Ostatnie zamówienia:\n"
+    text = "🕰️ Ostatnie zamówienia:\n\n"
     for o in orders:
-        text += f"ID: {o[0]} | {o[1]} | {o[2]} x{o[3]} | Status: {o[4]}\n"
+        # o: id, username, product_name, quantity, status, total_price, delivery_method
+        status_icon = '🆗' if o[4] == 'confirmed' else '⛔'
+        text += (
+            f"🔹 ID: {o[0]} | {status_icon}\n"
+            f"👤 {o[1]}\n"
+            f"🏷️ {o[2]} x{o[3]}\n"
+            f"💰 {o[5]:.2f} PLN\n"
+            f"📦 {o[6]}\n"
+            "-------------------\n"
+        )
     await message.answer(text)
 
 
@@ -998,7 +1034,7 @@ async def choose_delivery(callback: CallbackQuery, state: FSMContext) -> None:
 @order_router.callback_query(OrderStates.choosing_pickup_city, F.data.startswith("pickup_city:"))
 async def choose_pickup_city(callback: CallbackQuery, state: FSMContext) -> None:
     city = callback.data.split(":")[1]
-    await state.update_data(shipping_method=None, address=f"Odbiór osobisty: {city}")
+    await state.update_data(shipping_method=None, shipping_cost=0.0, address=f"Odbiór osobisty: {city}")
     
     await state.set_state(OrderStates.choosing_payment)
     await callback.message.answer(
@@ -1013,17 +1049,102 @@ async def choose_payment(callback: CallbackQuery, state: FSMContext) -> None:
     payment_method = callback.data.split(":")[1]
     await state.update_data(payment_method=payment_method)
     
-    if callback.from_user:
-        await finalize_order(callback.message, state, callback.from_user)
+    # Podsumowanie zamówienia
+    data = await state.get_data()
+    product_name = data["product_name"]
+    variant_name = data["variant_name"]
+    quantity = data["quantity"]
+    price = data["price"]
+    delivery_type = data["delivery_type"]
+    shipping_method = data.get("shipping_method")
+    shipping_cost = data.get("shipping_cost", 0.0)
+    address = data.get("address")
+    phone = data.get("phone")
+    
+    total_price = (quantity * price) + shipping_cost
+    
+    summary_text = (
+        "📋 **Podsumowanie zamówienia**\n\n"
+        f"🏷️ Produkt: {product_name} ({variant_name})\n"
+        f"🔢 Ilość: {quantity}\n"
+        f"🚚 Dostawa: {delivery_type}"
+    )
+    
+    if shipping_method:
+        summary_text += f" ({shipping_method})"
+    
+    summary_text += f"\n💰 Łączna kwota: {total_price:.2f} PLN\n"
+    
+    if address:
+        summary_text += f"📬 Adres: {address}\n"
+    if phone:
+        summary_text += f"📞 Telefon: {phone}\n"
+        
+    summary_text += f"💳 Płatność: {payment_method}\n\n"
+    summary_text += "Czy wszystko się zgadza?"
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Tak ✅", callback_data="confirm_order:yes")
+    builder.button(text="Nie ❌", callback_data="confirm_order:no")
+    builder.button(text="Chcę anulować zamówienie 🚫", callback_data="confirm_order:cancel")
+    builder.adjust(2, 1)
+    
+    await state.set_state(OrderStates.confirming_order)
+    await callback.message.edit_text(summary_text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@order_router.callback_query(OrderStates.confirming_order, F.data.startswith("confirm_order:"))
+async def process_order_confirmation(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":")[1]
+    
+    if action == "yes":
+        if callback.message and callback.from_user:
+            # Przekazujemy message z callbacku, żeby finalize_order mogło odpowiedzieć
+            await finalize_order(callback.message, state, callback.from_user)
+    elif action == "no":
+        await state.clear()
+        await callback.message.edit_text("Rozumiem, że dane się nie zgadzają. Zacznijmy od nowa.\nWybierz /start aby rozpocząć.")
+    elif action == "cancel":
+        await state.clear()
+        await callback.message.edit_text("🚫 Zamówienie zostało anulowane.")
+    
     await callback.answer()
 
 
 @order_router.callback_query(OrderStates.choosing_shipping, F.data.startswith("shipping:"))
 async def choose_shipping_method(callback: CallbackQuery, state: FSMContext) -> None:
     shipping_method = callback.data.split(":")[1]
-    await state.update_data(shipping_method=shipping_method)
+    
+    if shipping_method == "DPD":
+        await state.set_state(OrderStates.choosing_dpd_option)
+        await callback.message.answer(
+            "Wybierz opcję dostawy DPD:",
+            reply_markup=dpd_options_keyboard().as_markup()
+        )
+    else:
+        # InPost - koszt 12 zł
+        await state.update_data(shipping_method="InPost", shipping_cost=12.0)
+        await state.set_state(OrderStates.entering_address)
+        await callback.message.answer("📬 Podaj adres dostawy (paczkomat, ulica itp.):")
+    
+    await callback.answer()
+
+
+@order_router.callback_query(OrderStates.choosing_dpd_option, F.data.startswith("dpd_option:"))
+async def choose_dpd_option(callback: CallbackQuery, state: FSMContext) -> None:
+    option = callback.data.split(":")[1]
+    
+    if option == "point":
+        cost = 6.0
+        details = "DPD Punkt"
+    else:
+        cost = 10.0
+        details = "DPD Automat"
+        
+    await state.update_data(shipping_method=details, shipping_cost=cost)
     await state.set_state(OrderStates.entering_address)
-    await callback.message.answer("📬 Podaj adres dostawy (ulica, nr domu, kod, miasto, paczkomat itp.):")
+    await callback.message.answer("📬 Podaj adres dostawy (punkt/automat, miasto):")
     await callback.answer()
 
 
@@ -1035,11 +1156,23 @@ async def enter_address(message: Message, state: FSMContext) -> None:
         return
     
     await state.update_data(address=address)
-    if message.from_user:
-        await finalize_order(message, state, message.from_user)
+    await state.set_state(OrderStates.entering_phone)
+    await message.answer("📞 Podaj numer telefonu dla kuriera (np. 123456789):")
 
 
-@order_router.callback_query(F.data.startswith(("product:", "delivery:", "shipping:", "pickup_city:", "payment:")))
+@order_router.message(OrderStates.entering_phone)
+async def enter_phone(message: Message, state: FSMContext) -> None:
+    phone = (message.text or "").strip()
+    if len(phone) < 9:
+        await message.answer("⚠️ Numer telefonu wydaje się niepoprawny. Spróbuj ponownie.")
+        return
+        
+    await state.update_data(phone=phone)
+    await state.set_state(OrderStates.choosing_payment)
+    await message.answer("💳 Wybierz metodę płatności:", reply_markup=payment_keyboard().as_markup())
+
+
+@order_router.callback_query(F.data.startswith(("product:", "delivery:", "shipping:", "dpd_option:", "pickup_city:", "payment:", "confirm_order:")))
 async def session_expired(callback: CallbackQuery) -> None:
     await callback.answer("⛔ Sesja wygasła. Wybierz 'Kupuję' z menu ponownie.", show_alert=True)
 
@@ -1054,24 +1187,26 @@ async def finalize_order(message: Message, state: FSMContext, user: User) -> Non
     price = data["price"]
     delivery_type = data["delivery_type"]
     shipping_method = data.get("shipping_method")
+    shipping_cost = data.get("shipping_cost", 0.0)
     address = data.get("address")
+    phone = data.get("phone")
     payment_method = data.get("payment_method")
     
-    total_price = quantity * price
+    total_price = (quantity * price) + shipping_cost
     
     # Check variant stock
     variant = await fetch_variant(variant_id)
     if not variant or variant[2] < quantity:
-        await message.answer("⛔ Niestety wybrany wariant w międzyczasie się wyprzedał.")
+        await message.edit_text("⛔ Niestety wybrany wariant w międzyczasie się wyprzedał.")
         await state.clear()
         return
-
+    
     # Deduct stock from variant
     if not await decrement_variant_stock(variant_id, quantity):
-        await message.answer("⛔ Błąd systemu podczas aktualizacji stanu.")
+        await message.edit_text("⛔ Błąd systemu podczas aktualizacji stanu.")
         await state.clear()
         return
-
+    
     # Create order
     full_product_name = f"{product_name} ({variant_name})"
     details = f"Dostawa: {delivery_type}"
@@ -1079,11 +1214,13 @@ async def finalize_order(message: Message, state: FSMContext, user: User) -> Non
         details += f", Przewoźnik: {shipping_method}"
     if address:
         details += f", Adres: {address}"
+    if phone:
+        details += f", Telefon: {phone}"
     if payment_method:
         details += f", Płatność: {payment_method}"
-
+    
     order_id = await create_order(
-        user.id, user.full_name, full_product_name, quantity, total_price, details, address
+        user.id, f"{user.full_name} (@{user.username or '-'})", full_product_name, quantity, total_price, details, address
     )
     
     await notify_admins(
@@ -1091,7 +1228,7 @@ async def finalize_order(message: Message, state: FSMContext, user: User) -> Non
     )
     
     await state.clear()
-    await message.answer(
+    await message.edit_text(
         f"🆗 Zamówienie przyjęte (ID: {order_id})!\n"
         f"🏷️ Produkt: {full_product_name}\n"
         f"🔢 Ilość: {quantity}\n"
@@ -1134,12 +1271,30 @@ async def process_order_decision(callback: CallbackQuery) -> None:
     user_id = await update_order_status(order_id, status)
     
     if user_id:
-        new_text = f"Zamówienie {order_id} zostało {'🆗 potwierdzone' if status == 'confirmed' else '⛔ odrzucone'}."
+        # Pobierz szczegóły zamówienia, aby zaktualizować wiadomość admina
+        order_details = await fetch_order_details(order_id)
+        
+        status_text = '🆗 potwierdzone' if status == 'confirmed' else '⛔ odrzucone'
+        
+        if order_details:
+            # order_details: id, username, product_name, quantity, total_price, delivery_method, address, status
+            # Używamy formatowania z notify_admins, aby zachować spójność
+            new_text = (
+                f"Zamówienie {order_id} zostało {status_text}.\n\n"
+                f"🆔 Użytkownik: {order_details[1]}\n"
+                f"🏷️ Produkt: {order_details[2]}\n"
+                f"🔢 Ilość: {order_details[3]}\n"
+                f"💰 Kwota: {order_details[4]:.2f} PLN\n"
+                f"📝 Szczegóły: {order_details[5]}"
+            )
+        else:
+            new_text = f"Zamówienie {order_id} zostało {status_text}."
+            
         await callback.message.edit_text(new_text)
         
         # Powiadom użytkownika
         user_msg = (
-            f"ℹ️ Twoje zamówienie #{order_id} zostało {'potwierdzone 🆗' if status == 'confirmed' else 'odrzucone ⛔'}."
+            f"ℹ️ Twoje zamówienie #{order_id} zostało {status_text}."
         )
         try:
             await callback.bot.send_message(user_id, user_msg)
