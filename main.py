@@ -208,7 +208,7 @@ async def upsert_variant(product_id: int, variant_name: str, quantity: int) -> N
         INSERT INTO variants (product_id, name, quantity)
         VALUES (?, ?, ?)
         ON CONFLICT(product_id, name) DO UPDATE SET
-            quantity = quantity + excluded.quantity
+            quantity = variants.quantity + excluded.quantity
         """,
         (product_id, variant_name, quantity), commit=True
     )
