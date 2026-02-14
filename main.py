@@ -166,7 +166,7 @@ async def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id BIGINT NOT NULL,
             username TEXT,
             product_name TEXT NOT NULL,
             quantity INTEGER NOT NULL,
@@ -178,6 +178,13 @@ async def init_db() -> None:
         )
         """, commit=True
     )
+
+    # Migracja user_id na BIGINT dla Postgresa (jeśli tabela już istnieje ze zwykłym INTEGER)
+    if config.database_url:
+        try:
+            await DB.execute("ALTER TABLE orders ALTER COLUMN user_id TYPE BIGINT", commit=True)
+        except Exception:
+            pass
 
 
 async def upsert_stock(name: str, price: float) -> int:
