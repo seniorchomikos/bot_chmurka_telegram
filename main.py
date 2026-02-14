@@ -418,6 +418,7 @@ class OrderStates(StatesGroup):
     choosing_shipping = State()
     choosing_dpd_option = State()
     entering_address = State()
+    choosing_pickup_city = State()
     entering_phone = State()
     choosing_payment = State()
     confirming_order = State()
