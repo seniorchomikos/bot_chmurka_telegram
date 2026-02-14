@@ -1,10 +1,12 @@
 import asyncio
 import os
+import re
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Any
 
 import aiosqlite
-from aiohttp import web
+import asyncpg
+from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.filters import Command, CommandStart
@@ -23,6 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 class Config:
     bot_token: str
     db_path: str
+    database_url: Optional[str]
     admin_ids: set[int]
 
 
@@ -35,204 +38,237 @@ def load_config() -> Config:
         for value in os.getenv("ADMIN_IDS", "6498309404").split(",")
         if value.strip().isdigit()
     }
-    return Config(bot_token=token, db_path="bot.db", admin_ids=admin_ids)
+    database_url = os.getenv("DATABASE_URL")
+    return Config(bot_token=token, db_path="bot.db", database_url=database_url, admin_ids=admin_ids)
 
 
 config = load_config()
 
 
 # =========================
-# Baza danych
+# Baza danych (Adapter SQLite / Postgres)
 # =========================
+
+class DB:
+    _pool = None
+
+    @classmethod
+    async def connect(cls):
+        if config.database_url:
+            # PostgreSQL connection
+            if not cls._pool:
+                cls._pool = await asyncpg.create_pool(config.database_url)
+        else:
+            # SQLite connection (managed per query usually in aiosqlite, or single connection)
+            pass
+
+    @classmethod
+    async def execute(cls, sql: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = False) -> Any:
+        if config.database_url:
+            # PostgreSQL logic
+            param_counter = iter(range(1, 100))
+            pg_sql = re.sub(r'\?', lambda _: f"${next(param_counter)}", sql)
+            
+            pg_sql = pg_sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            pg_sql = pg_sql.replace("OR IGNORE", "ON CONFLICT DO NOTHING")
+            
+            async with cls._pool.acquire() as conn:
+                if fetchone:
+                    return await conn.fetchrow(pg_sql, *params)
+                elif fetchall:
+                    return await conn.fetch(pg_sql, *params)
+                else:
+                    status = await conn.execute(pg_sql, *params)
+                    # Extract row count from status string (e.g., "UPDATE 1", "DELETE 1", "INSERT 0 1")
+                    try:
+                        return int(status.split()[-1])
+                    except (ValueError, IndexError):
+                        return 0
+        else:
+            # SQLite logic
+            async with aiosqlite.connect(config.db_path) as db:
+                await db.execute("PRAGMA foreign_keys = ON")
+                
+                cursor = await db.execute(sql, params)
+                if fetchone:
+                    res = await cursor.fetchone()
+                    await cursor.close()
+                    if commit: await db.commit()
+                    return res
+                elif fetchall:
+                    res = await cursor.fetchall()
+                    await cursor.close()
+                    if commit: await db.commit()
+                    return res
+                else:
+                    last_id = cursor.lastrowid
+                    row_count = cursor.rowcount
+                    await cursor.close()
+                    if commit: await db.commit()
+                    return last_id if "INSERT" in sql.upper() and "RETURNING" not in sql.upper() else row_count
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect(config.db_path) as db:
-        # Tabela stock
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                quantity INTEGER NOT NULL CHECK(quantity >= 0),
-                price REAL NOT NULL DEFAULT 0.0
-            )
-            """
+    await DB.connect()
+    
+    # Tabela stock
+    await DB.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            quantity INTEGER NOT NULL CHECK(quantity >= 0),
+            price REAL NOT NULL DEFAULT 0.0
         )
-        # Migracja dla kolumny price (jeśli tabela już istniała bez niej)
-        try:
-            await db.execute("ALTER TABLE stock ADD COLUMN price REAL NOT NULL DEFAULT 0.0")
-        except aiosqlite.OperationalError:
-            pass  # Kolumna już istnieje
+        """, commit=True
+    )
+    
+    # Migracja kolumny price - w PG ALTER TABLE działa inaczej, ale IF NOT EXISTS w kolumnach jest trudne
+    # Proste obejście: ignorujemy błąd "column exists"
+    try:
+        await DB.execute("ALTER TABLE stock ADD COLUMN price REAL NOT NULL DEFAULT 0.0", commit=True)
+    except Exception:
+        pass
 
-        # Tabela variants (warianty/smaki)
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS variants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                quantity INTEGER NOT NULL CHECK(quantity >= 0),
-                FOREIGN KEY(product_id) REFERENCES stock(id) ON DELETE CASCADE,
-                UNIQUE(product_id, name)
-            )
-            """
+    # Tabela variants
+    await DB.execute(
+        """
+        CREATE TABLE IF NOT EXISTS variants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            quantity INTEGER NOT NULL CHECK(quantity >= 0),
+            FOREIGN KEY(product_id) REFERENCES stock(id) ON DELETE CASCADE,
+            UNIQUE(product_id, name)
         )
+        """, commit=True
+    )
 
-        # Migracja: przenieś stare stocki do wariantów "Domyślny" jeśli nie mają wariantów
-        cursor = await db.execute("SELECT id, quantity FROM stock WHERE quantity > 0")
-        existing_stocks = await cursor.fetchall()
-        await cursor.close()
+    # Migracja starych stocków
+    existing_stocks = await DB.execute("SELECT id, quantity FROM stock WHERE quantity > 0", fetchall=True)
+    
+    for row in existing_stocks:
+        # asyncpg zwraca Record, aiosqlite tuple/Row. Record działa jak dict i tuple.
+        p_id = row[0]
+        p_qty = row[1]
         
-        for p_id, p_qty in existing_stocks:
-            # Sprawdź czy ma warianty
-            cursor = await db.execute("SELECT 1 FROM variants WHERE product_id = ?", (p_id,))
-            has_variants = await cursor.fetchone()
-            await cursor.close()
-            
-            if not has_variants:
-                await db.execute(
-                    "INSERT INTO variants (product_id, name, quantity) VALUES (?, 'Domyślny', ?) ON CONFLICT DO NOTHING",
-                    (p_id, p_qty)
-                )
-                # Opcjonalnie: zerujemy quantity w stock, bo teraz variants rządzą
-                # await db.execute("UPDATE stock SET quantity = 0 WHERE id = ?", (p_id,))
-
-        # Tabela orders
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                product_name TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                total_price REAL NOT NULL,
-                delivery_method TEXT NOT NULL,
-                address TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        has_variants = await DB.execute("SELECT 1 FROM variants WHERE product_id = ?", (p_id,), fetchone=True)
+        
+        if not has_variants:
+            # ON CONFLICT składnia jest taka sama w PG i SQLite dla standardu
+            await DB.execute(
+                "INSERT INTO variants (product_id, name, quantity) VALUES (?, 'Domyślny', ?) ON CONFLICT DO NOTHING",
+                (p_id, p_qty), commit=True
             )
-            """
+
+    # Tabela orders
+    await DB.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            product_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            total_price REAL NOT NULL,
+            delivery_method TEXT NOT NULL,
+            address TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        await db.commit()
+        """, commit=True
+    )
 
 
 async def upsert_stock(name: str, price: float) -> int:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO stock (name, quantity, price)
-            VALUES (?, 0, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                price = excluded.price
-            RETURNING id
-            """,
-            (name, price),
-        )
-        row = await cursor.fetchone()
-        await db.commit()
-        return row[0]
+    # RETURNING id działa w obu (SQLite od 3.35, Postgres standard)
+    row = await DB.execute(
+        """
+        INSERT INTO stock (name, quantity, price)
+        VALUES (?, 0, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            price = excluded.price
+        RETURNING id
+        """,
+        (name, price), fetchone=True, commit=True
+    )
+    return row[0]
 
 
 async def upsert_variant(product_id: int, variant_name: str, quantity: int) -> None:
-    async with aiosqlite.connect(config.db_path) as db:
-        await db.execute(
-            """
-            INSERT INTO variants (product_id, name, quantity)
-            VALUES (?, ?, ?)
-            ON CONFLICT(product_id, name) DO UPDATE SET
-                quantity = quantity + excluded.quantity
-            """,
-            (product_id, variant_name, quantity),
-        )
-        await db.commit()
+    await DB.execute(
+        """
+        INSERT INTO variants (product_id, name, quantity)
+        VALUES (?, ?, ?)
+        ON CONFLICT(product_id, name) DO UPDATE SET
+            quantity = quantity + excluded.quantity
+        """,
+        (product_id, variant_name, quantity), commit=True
+    )
 
 
 async def fetch_products() -> list[tuple[int, str, int, float]]:
-    # Zwraca produkty, które mają jakiekolwiek warianty z ilością > 0
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            SELECT s.id, s.name, COALESCE(SUM(v.quantity), 0) as total_qty, s.price
-            FROM stock s
-            LEFT JOIN variants v ON s.id = v.product_id
-            GROUP BY s.id
-            HAVING total_qty > 0
-            ORDER BY s.name
-            """
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    rows = await DB.execute(
+        """
+        SELECT s.id, s.name, COALESCE(SUM(v.quantity), 0) as total_qty, s.price
+        FROM stock s
+        LEFT JOIN variants v ON s.id = v.product_id
+        GROUP BY s.id
+        HAVING COALESCE(SUM(v.quantity), 0) > 0
+        ORDER BY s.name
+        """, fetchall=True
+    )
+    # Convert asyncpg Records to tuples if needed, but they are iterable so it's fine
+    return rows
 
 
 async def fetch_product_variants(product_id: int) -> list[tuple[int, str, int]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT id, name, quantity FROM variants WHERE product_id = ? AND quantity > 0 ORDER BY name",
-            (product_id,)
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    return await DB.execute(
+        "SELECT id, name, quantity FROM variants WHERE product_id = ? AND quantity > 0 ORDER BY name",
+        (product_id,), fetchall=True
+    )
 
 
 async def fetch_variant(variant_id: int) -> Optional[tuple[int, str, int, int, str, float]]:
-    # returns: id, name, quantity, product_id, product_name, product_price
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            SELECT v.id, v.name, v.quantity, s.id, s.name, s.price
-            FROM variants v
-            JOIN stock s ON v.product_id = s.id
-            WHERE v.id = ?
-            """,
-            (variant_id,)
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return row
+    return await DB.execute(
+        """
+        SELECT v.id, v.name, v.quantity, s.id, s.name, s.price
+        FROM variants v
+        JOIN stock s ON v.product_id = s.id
+        WHERE v.id = ?
+        """,
+        (variant_id,), fetchone=True
+    )
 
 
 async def fetch_product_variants_admin(product_id: int) -> list[tuple[int, str, int]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT id, name, quantity FROM variants WHERE product_id = ? ORDER BY name",
-            (product_id,)
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    return await DB.execute(
+        "SELECT id, name, quantity FROM variants WHERE product_id = ? ORDER BY name",
+        (product_id,), fetchall=True
+    )
 
 
 async def update_variant_name(variant_id: int, new_name: str) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        try:
-            cursor = await db.execute(
-                "UPDATE variants SET name = ? WHERE id = ?", (new_name, variant_id)
-            )
-            await db.commit()
-            return cursor.rowcount == 1
-        except aiosqlite.IntegrityError:
-            return False
+    try:
+        row_count = await DB.execute(
+            "UPDATE variants SET name = ? WHERE id = ?", (new_name, variant_id), commit=True
+        )
+        return row_count == 1
+    except Exception:
+        return False
 
 
 async def delete_variant(variant_id: int) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute("DELETE FROM variants WHERE id = ?", (variant_id,))
-        await db.commit()
-        return cursor.rowcount == 1
+    row_count = await DB.execute("DELETE FROM variants WHERE id = ?", (variant_id,), commit=True)
+    return row_count == 1
 
 
 async def decrement_variant_stock(variant_id: int, quantity: int) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "UPDATE variants SET quantity = quantity - ? WHERE id = ? AND quantity >= ?",
-            (quantity, variant_id, quantity),
-        )
-        await db.commit()
-        return cursor.rowcount == 1
+    row_count = await DB.execute(
+        "UPDATE variants SET quantity = quantity - ? WHERE id = ? AND quantity >= ?",
+        (quantity, variant_id, quantity), commit=True
+    )
+    return row_count == 1
 
 
 async def create_order(
@@ -244,125 +280,97 @@ async def create_order(
     delivery_method: str,
     address: Optional[str],
 ) -> int:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO orders (user_id, username, product_name, quantity, total_price, delivery_method, address, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-            """,
-            (user_id, username, product_name, quantity, total_price, delivery_method, address),
-        )
-        await db.commit()
-        return cursor.lastrowid
+    row = await DB.execute(
+        """
+        INSERT INTO orders (user_id, username, product_name, quantity, total_price, delivery_method, address, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        RETURNING id
+        """,
+        (user_id, username, product_name, quantity, total_price, delivery_method, address),
+        fetchone=True, commit=True
+    )
+    return row[0]
 
 
 async def update_order_status(order_id: int, status: str) -> Optional[int]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "UPDATE orders SET status = ? WHERE id = ? RETURNING user_id", (status, order_id)
-        )
-        row = await cursor.fetchone()
-        await db.commit()
-        return row[0] if row else None
+    row = await DB.execute(
+        "UPDATE orders SET status = ? WHERE id = ? RETURNING user_id",
+        (status, order_id),
+        fetchone=True, commit=True
+    )
+    return row[0] if row else None
 
 
 async def has_confirmed_orders(user_id: int) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM orders WHERE user_id = ? AND status = 'confirmed' LIMIT 1",
-            (user_id,),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return row is not None
+    row = await DB.execute(
+        "SELECT 1 FROM orders WHERE user_id = ? AND status = 'confirmed' LIMIT 1",
+        (user_id,), fetchone=True
+    )
+    return row is not None
 
 
 async def get_user_stats(user_id: int) -> tuple[int, float]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            SELECT SUM(quantity), SUM(total_price)
-            FROM orders
-            WHERE user_id = ? AND status = 'confirmed'
-            """,
-            (user_id,),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return (row[0] or 0, row[1] or 0.0)
+    row = await DB.execute(
+        """
+        SELECT SUM(quantity), SUM(total_price)
+        FROM orders
+        WHERE user_id = ? AND status = 'confirmed'
+        """,
+        (user_id,), fetchone=True
+    )
+    return (row[0] or 0, row[1] or 0.0)
 
 
 async def get_all_users() -> list[tuple[str, int]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT DISTINCT username, user_id FROM orders WHERE username IS NOT NULL"
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    return await DB.execute(
+        "SELECT DISTINCT username, user_id FROM orders WHERE username IS NOT NULL",
+        fetchall=True
+    )
 
 
 async def get_pending_orders() -> list[tuple[int, str, str, int, float]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT id, username, product_name, quantity, total_price FROM orders WHERE status = 'pending'"
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    return await DB.execute(
+        "SELECT id, username, product_name, quantity, total_price FROM orders WHERE status = 'pending'",
+        fetchall=True
+    )
 
 
 async def get_order_history() -> list[tuple[int, str, str, int, str]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT id, username, product_name, quantity, status FROM orders WHERE status != 'pending' ORDER BY created_at DESC LIMIT 10"
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
-
+    return await DB.execute(
+        "SELECT id, username, product_name, quantity, status FROM orders WHERE status != 'pending' ORDER BY created_at DESC LIMIT 10",
+        fetchall=True
+    )
 
 
 async def fetch_product_simple(product_id: int) -> Optional[tuple[int, str, float]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "SELECT id, name, price FROM stock WHERE id = ?", (product_id,)
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return row
+    return await DB.execute(
+        "SELECT id, name, price FROM stock WHERE id = ?", (product_id,), fetchone=True
+    )
 
 
 async def delete_product(product_id: int) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute("DELETE FROM stock WHERE id = ?", (product_id,))
-        await db.commit()
-        return cursor.rowcount == 1
+    row_count = await DB.execute("DELETE FROM stock WHERE id = ?", (product_id,), commit=True)
+    return row_count == 1
 
 
 async def update_product_quantity(product_id: int, new_quantity: int) -> bool:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            "UPDATE stock SET quantity = ? WHERE id = ?", (new_quantity, product_id)
-        )
-        await db.commit()
-        return cursor.rowcount == 1
+    row_count = await DB.execute(
+        "UPDATE stock SET quantity = ? WHERE id = ?", (new_quantity, product_id), commit=True
+    )
+    return row_count == 1
 
 
 async def fetch_all_products_admin() -> list[tuple[int, str, int, float]]:
-    async with aiosqlite.connect(config.db_path) as db:
-        cursor = await db.execute(
-            """
-            SELECT s.id, s.name, COALESCE(SUM(v.quantity), 0) as total_qty, s.price
-            FROM stock s
-            LEFT JOIN variants v ON s.id = v.product_id
-            GROUP BY s.id
-            ORDER BY s.name
-            """
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        return rows
+    return await DB.execute(
+        """
+        SELECT s.id, s.name, COALESCE(SUM(v.quantity), 0) as total_qty, s.price
+        FROM stock s
+        LEFT JOIN variants v ON s.id = v.product_id
+        GROUP BY s.id
+        ORDER BY s.name
+        """,
+        fetchall=True
+    )
 
 
 # =========================
@@ -1137,6 +1145,22 @@ async def process_order_decision(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+async def keep_alive():
+    url = os.getenv("WEBHOOK_URL")
+    if not url:
+        return
+    async with ClientSession() as session:
+        while True:
+            try:
+                # Pinguj główny URL (nie webhook endpoint, żeby nie triggerować błędów)
+                # Jeśli WEBHOOK_URL to np. https://app.onrender.com, to pingujemy to.
+                async with session.get(url) as resp:
+                    await resp.text()
+            except Exception:
+                pass
+            await asyncio.sleep(120)  # Ping co 2 minuty
+
+
 async def main() -> None:
     bot = Bot(token=config.bot_token)
     
@@ -1169,12 +1193,18 @@ async def main() -> None:
         # Rejestracja endpointu webhooka
         webhook_requests_handler.register(app, path="/webhook")
         
+        # Handler dla root path (health check / keep-alive)
+        async def root_handler(request):
+            return web.Response(text="Bot is running correctly")
+        app.router.add_get("/", root_handler)
+        
         # Setup aplikacji (automatycznie dodaje on_startup/on_shutdown)
         setup_application(app, dp, bot=bot)
 
         # Ustawienie webhooka na starcie
         async def on_startup(app):
             await bot.set_webhook(f"{webhook_url}/webhook")
+            asyncio.create_task(keep_alive())
             
         app.on_startup.append(on_startup)
 
