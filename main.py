@@ -520,7 +520,7 @@ def shipping_keyboard() -> InlineKeyboardBuilder:
 
 def dpd_options_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🏪 Do punktu (+6 PLN)", callback_data="dpd_option:point")
+    builder.button(text="🏪 Do punktu (+10 PLN)", callback_data="dpd_option:point")
     builder.button(text="📦 Do automatu (+10 PLN)", callback_data="dpd_option:machine")
     builder.adjust(1)
     return builder
@@ -1138,7 +1138,7 @@ async def choose_dpd_option(callback: CallbackQuery, state: FSMContext) -> None:
     option = callback.data.split(":")[1]
     
     if option == "point":
-        cost = 6.0
+        cost = 10.0
         details = "DPD Punkt"
     else:
         cost = 10.0
