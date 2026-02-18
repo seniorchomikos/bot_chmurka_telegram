@@ -533,10 +533,11 @@ def pickup_cities_keyboard() -> InlineKeyboardBuilder:
     return builder
 
 
-def payment_keyboard() -> InlineKeyboardBuilder:
+def payment_keyboard(allow_cash: bool = True) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text="💸 BLIK", callback_data="payment:BLIK")
-    builder.button(text="💵 Gotówka", callback_data="payment:Gotówka")
+    if allow_cash:
+        builder.button(text="💵 Gotówka", callback_data="payment:Gotówka")
     builder.adjust(2)
     return builder
 
@@ -1170,7 +1171,7 @@ async def enter_phone(message: Message, state: FSMContext) -> None:
         
     await state.update_data(phone=phone)
     await state.set_state(OrderStates.choosing_payment)
-    await message.answer("💳 Wybierz metodę płatności:", reply_markup=payment_keyboard().as_markup())
+    await message.answer("💳 Wybierz metodę płatności:", reply_markup=payment_keyboard(allow_cash=False).as_markup())
 
 
 @order_router.callback_query(F.data.startswith(("product:", "delivery:", "shipping:", "dpd_option:", "pickup_city:", "payment:", "confirm_order:")))
